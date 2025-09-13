@@ -1,0 +1,23 @@
+Игнорируем файлы кэша Python
+pycache/
+*.pyc
+*.pyo
+*.pyd
+
+Игнорируем виртуальные окружения
+venv/
+env/
+.venv/
+
+Игнорируем файлы, генерируемые парсером
+*.csv
+*.docx
+*.png
+*.html
+
+Игнорируем файлы IDE и редакторов
+.vscode/
+.idea/
+
+Игнорируем файлы webdriver-manager
+/home/yaroslavupwork97/.wdm/
