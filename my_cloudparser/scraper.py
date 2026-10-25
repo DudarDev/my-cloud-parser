@@ -1,31 +1,28 @@
 # -*- coding: utf-8 -*-
+"""
+Профессиональный парсер Swappa.com (версия 6.0 Pro).
+Включает ООП-архитектуру SwappaScraper, гибридный режим (ScrapingBee / Direct / Local HTML),
+очистку и нормализацию данных, расчет метрик выгоды (deal_score).
+"""
 
-# --- Документація ---
-# Професійний парсер для сайту Swappa.com.
-# ВЕРСІЯ 5.0: Гнучка конфігурація, стійкий до змін парсинг, підтримка 4 форматів.
-#
-# - Налаштування через аргументи командного рядка (URL, API-ключ, ім'я файлу).
-# - Використовує карту колонок для надійного вилучення даних.
-# - Зберігає звіти в форматах CSV, DOCX, JSON та XLSX.
-#
-# Автор: Ярослав (при содействии Gemini)
-
-# --- 1. Імпорт необхідних бібліотек ---
-import requests
-import pandas as pd
-from bs4 import BeautifulSoup
-from docx import Document
+import os
+import re
+import json
 import logging
-import argparse  # Для обробки аргументів командного рядка
-import json      # Для збереження в JSON
+from typing import List, Dict, Any, Optional
+import requests
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 
-# --- 2. Налаштування логування ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Загрузка переменных окружения из .env файла
+load_dotenv()
 
-# --- 3. Карта колонок для надійного парсингу ---
-# Описує, в якій за рахунком колонці (індекс) знаходяться потрібні дані.
-# Якщо Swappa змінить порядок колонок, достатньо буде змінити цифри тут.
-COLUMN_MAPPING = {
+# Импорт модулей экспорта и аналитики
+from .exporters import save_to_csv, save_to_xlsx, save_to_json, save_to_docx
+from .analytics import calculate_statistics
+
+# Карта колонок по умолчанию для Swappa table#listings_table
+DEFAULT_COLUMN_MAPPING = {
     "price": 1,
     "carrier": 3,
     "color": 4,
@@ -39,152 +36,263 @@ COLUMN_MAPPING = {
     "code": 13
 }
 
+# Обратная совместимость с версией 5.0
+COLUMN_MAPPING = DEFAULT_COLUMN_MAPPING
 
-def fetch_page_html(api_key: str, url: str) -> str:
+
+class SwappaScraper:
     """
-    Відправляє запит до ScrapingBee API для отримання HTML-кода сторінки.
+    Основной класс скрапера для Swappa.com.
     """
-    logging.info(f"Відправка запиту на отримання HTML через ScrapingBee для URL: {url}")
-    response = requests.get(
-        url='https://app.scrapingbee.com/api/v1/',
-        params={'api_key': api_key, 'url': url, 'render_js': 'true'}
+
+    DEFAULT_USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
     )
-    if response.status_code == 200:
-        logging.info("HTML-код сторінки успішно отримано.")
-        return response.text
-    else:
-        logging.error(f"Помилка при отриманні сторінки. Статус: {response.status_code}, Відповідь: {response.text}")
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        use_direct: bool = False,
+        column_mapping: Optional[Dict[str, int]] = None,
+        timeout: int = 45
+    ):
+        """
+        :param api_key: ScrapingBee API ключ. Если не указан, берется из переменной SCRAPINGBEE_API_KEY.
+        :param use_direct: Принудительный прямой запрос без ScrapingBee.
+        :param column_mapping: Пользовательская карта колонок.
+        :param timeout: Таймаут запроса в секундах.
+        """
+        self.api_key = api_key or os.getenv("SCRAPINGBEE_API_KEY")
+        self.use_direct = use_direct
+        self.column_mapping = column_mapping or DEFAULT_COLUMN_MAPPING
+        self.timeout = timeout
+        self.scraped_data: List[Dict[str, Any]] = []
+        self.statistics: Dict[str, Any] = {}
+
+    def fetch_html(self, url: str, render_js: bool = True) -> Optional[str]:
+        """
+        Получение HTML страницы через ScrapingBee или прямым HTTP-запросом.
+        """
+        if self.use_direct or not self.api_key:
+            if not self.api_key and not self.use_direct:
+                logging.warning("API-ключ ScrapingBee не найден в аргументах или .env. Переключение в прямой HTTP-режим...")
+            return self._fetch_direct(url)
+        else:
+            return self._fetch_scrapingbee(url, render_js=render_js)
+
+    def _fetch_scrapingbee(self, url: str, render_js: bool = True) -> Optional[str]:
+        """Запрос через API ScrapingBee."""
+        logging.info(f"Отправка запроса через ScrapingBee API к: {url}")
+        params = {
+            'api_key': self.api_key,
+            'url': url,
+            'render_js': 'true' if render_js else 'false'
+        }
+        try:
+            response = requests.get(
+                url='https://app.scrapingbee.com/api/v1/',
+                params=params,
+                timeout=self.timeout
+            )
+            if response.status_code == 200:
+                logging.info("HTML успешно получен от ScrapingBee.")
+                return response.text
+            else:
+                logging.error(f"Ошибка ScrapingBee API (код {response.status_code}): {response.text}")
+                return None
+        except Exception as e:
+            logging.error(f"Сетевая ошибка при запросе к ScrapingBee: {e}")
+            return None
+
+    def _fetch_direct(self, url: str) -> Optional[str]:
+        """Прямой запрос к сайту с маскировкой под реальный браузер."""
+        logging.info(f"Прямой HTTP-запрос к: {url}")
+        headers = {
+            "User-Agent": self.DEFAULT_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+            "Referer": "https://swappa.com/",
+            "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Upgrade-Insecure-Requests": "1"
+        }
+        try:
+            session = requests.Session()
+            response = session.get(url, headers=headers, timeout=self.timeout)
+            if response.status_code == 200:
+                logging.info("HTML успешно получен прямым запросом.")
+                return response.text
+            else:
+                logging.warning(f"Прямой запрос вернул статус {response.status_code}. Возможно, сработала защита Cloudflare.")
+                return None
+        except Exception as e:
+            logging.error(f"Ошибка при прямом HTTP-запросе: {e}")
+            return None
+
+    def load_from_file(self, filepath: str) -> Optional[str]:
+        """Загрузка HTML из локального файла (автономный режим)."""
+        logging.info(f"Загрузка HTML из локального файла: {filepath}")
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                return f.read()
+        except Exception as e:
+            logging.error(f"Ошибка чтения локального файла {filepath}: {e}")
+            return None
+
+    @staticmethod
+    def _clean_price(price_str: Optional[str]) -> Optional[float]:
+        """Преобразует строку цены ('$1,150.00', '$599') в float."""
+        if not price_str:
+            return None
+        cleaned = re.sub(r'[^\d.]', '', price_str)
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _clean_battery(battery_str: Optional[str]) -> Optional[int]:
+        """Извлекает число процентов батареи ('85%', '92%') в int."""
+        if not battery_str:
+            return None
+        match = re.search(r'(\d+)\s*%', battery_str)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                return None
         return None
 
+    @staticmethod
+    def _clean_storage(storage_str: Optional[str]) -> Optional[int]:
+        """Преобразует объем памяти в ГБ ('128 GB' -> 128, '1 TB' -> 1024)."""
+        if not storage_str:
+            return None
+        st = storage_str.upper()
+        if 'TB' in st:
+            m = re.search(r'(\d+)', st)
+            return int(m.group(1)) * 1024 if m else 1024
+        elif 'GB' in st:
+            m = re.search(r'(\d+)', st)
+            return int(m.group(1)) if m else None
+        return None
 
-def parse_html_data(html_content: str) -> list:
-    """
-    Приймає HTML-код, розбирає його і вилучає дані з таблиці,
-    використовуючи гнучку карту колонок COLUMN_MAPPING.
-    """
-    if not html_content:
-        return []
+    def _compute_deal_scores(self, items: List[Dict[str, Any]]) -> None:
+        """
+        Рассчитывает показатель выгоды (deal_score: от 1 до 100).
+        Основан на сравнении цены объявления с медианной ценой для аналогичной памяти и состояния.
+        """
+        prices = [x['price_numeric'] for x in items if x.get('price_numeric')]
+        if not prices:
+            return
 
-    logging.info("Починаємо розбір (парсинг) HTML-коду...")
-    soup = BeautifulSoup(html_content, 'html.parser')
-    
-    listing_elements = soup.select("table#listings_table tbody tr")
-    logging.info(f"Знайдено оголошень на сторінці: {len(listing_elements)}")
-    
-    if not listing_elements:
-        return []
+        median_price = sum(prices) / len(prices)
 
-    all_phones_data = []
-    for i, row in enumerate(listing_elements, 1):
-        try:
-            cells = row.select("td")
-            
-            # Перевірка, що в рядку достатньо колонок для безпечного парсингу
-            if len(cells) < max(COLUMN_MAPPING.values()) + 1:
+        for item in items:
+            p = item.get('price_numeric')
+            if p is None or median_price == 0:
+                item['deal_score'] = 50.0
                 continue
 
-            phone_data = {}
-            for field_name, cell_index in COLUMN_MAPPING.items():
-                # Спеціальна обробка для продавця, щоб взяти лише ім'я
-                if field_name == "seller":
-                    phone_data[field_name] = cells[cell_index].text.strip().split('\n')[0]
-                else:
-                    phone_data[field_name] = cells[cell_index].text.strip()
-            
-            all_phones_data.append(phone_data)
-        except Exception as e:
-            logging.warning(f"Не вдалося обробити рядок #{i}. Помилка: {e}. Пропускаємо.")
-            continue
-            
-    return all_phones_data
+            # Коэффициент выгоды: если цена ниже медианы на 20%, оценка ~ 80+
+            diff_ratio = (median_price - p) / median_price
+            base_score = 50.0 + (diff_ratio * 100.0)
 
+            # Бонус за хорошее состояние
+            cond = (item.get('condition') or '').lower()
+            if 'mint' in cond:
+                base_score += 10.0
+            elif 'good' in cond:
+                base_score += 5.0
 
-# --- Функції для збереження даних у різних форматах ---
+            # Бонус за высокую батарею
+            b = item.get('battery_numeric')
+            if b and b >= 90:
+                base_score += 5.0
+            elif b and b < 80:
+                base_score -= 8.0
 
-def save_to_csv(data: list, filename: str):
-    if not data: return
-    logging.info(f"Збереження {len(data)} записів у CSV: {filename}...")
-    try:
-        pd.DataFrame(data).to_csv(filename, index=False, encoding='utf-8')
-        logging.info(f"Файл {filename} успішно збережено.")
-    except Exception as e:
-        logging.error(f"Помилка при збереженні в CSV: {e}")
+            score = max(1.0, min(99.0, base_score))
+            item['deal_score'] = round(score, 1)
 
-def save_to_xlsx(data: list, filename: str):
-    if not data: return
-    logging.info(f"Збереження {len(data)} записів у XLSX: {filename}...")
-    try:
-        pd.DataFrame(data).to_excel(filename, index=False, engine='openpyxl')
-        logging.info(f"Файл {filename} успішно збережено.")
-    except Exception as e:
-        logging.error(f"Помилка при збереженні в XLSX: {e}")
+    def parse_html(self, html_content: str) -> List[Dict[str, Any]]:
+        """
+        Разбирает HTML страницы и возвращает обогащенный список объявлений.
+        """
+        if not html_content:
+            return []
 
-def save_to_json(data: list, filename: str):
-    if not data: return
-    logging.info(f"Збереження {len(data)} записів у JSON: {filename}...")
-    try:
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
-        logging.info(f"Файл {filename} успішно збережено.")
-    except Exception as e:
-        logging.error(f"Помилка при збереженні в JSON: {e}")
+        logging.info("Начинаем парсинг HTML-кода Swappa...")
+        soup = BeautifulSoup(html_content, 'html.parser')
 
-def save_to_docx(data: list, filename: str):
-    if not data: return
-    logging.info(f"Створення Word-звіту: {filename}...")
-    try:
-        document = Document()
-        document.add_heading('Звіт по оголошенням Swappa', level=1)
-        document.add_paragraph(f"Зібрано {len(data)} оголошень.")
-        
-        for item in data:
-            title = f"{item.get('storage')} {item.get('color')} ({item.get('condition')})"
-            document.add_heading(title, level=3)
-            p = document.add_paragraph()
-            p.add_run('Ціна: ').bold = True
-            p.add_run(f"{item.get('price', 'N/A')} | ")
-            p.add_run('Оператор: ').bold = True
-            p.add_run(f"{item.get('carrier', 'N/A')}\n")
-            p.add_run('Продавець: ').bold = True
-            p.add_run(f"{item.get('seller', 'N/A')} ({item.get('location', 'N/A')})")
+        listing_elements = soup.select("table#listings_table tbody tr")
+        logging.info(f"Найдено строк в таблице объявлений: {len(listing_elements)}")
 
-        document.save(filename)
-        logging.info(f"Звіт {filename} успішно збережено.")
-    except Exception as e:
-        logging.error(f"Помилка при збереженні в DOCX: {e}")
+        if not listing_elements:
+            return []
 
+        results = []
+        max_idx = max(self.column_mapping.values())
 
-def main():
-    """Головна функція, що керує всім процесом."""
-    parser = argparse.ArgumentParser(description="Парсер оголошень з сайту Swappa.com (v5.0)")
-    parser.add_argument('--api_key', type=str, required=True, help='Ваш API ключ від ScrapingBee')
-    parser.add_argument('--url', type=str, default="https://swappa.com/listings/apple-iphone-13-pro-max", help='URL сторінки для парсингу')
-    parser.add_argument('--output', type=str, default="swappa_report", help="Базове ім'я для вихідних файлів (без розширення)")
-    args = parser.parse_args()
+        for idx, row in enumerate(listing_elements, 1):
+            cells = row.select("td")
+            if len(cells) < max_idx + 1:
+                continue
 
-    logging.info("Запуск парсера v5.0 (Flexible CLI Version)...")
-    
-    html_content = fetch_page_html(args.api_key, args.url)
-    
-    if html_content:
-        scraped_data = parse_html_data(html_content)
-        if scraped_data:
-            # Створюємо імена файлів на основі аргументу --output
-            base_filename = args.output
-            # Зберігаємо дані в усіх форматах
-            save_to_csv(scraped_data, f"{base_filename}.csv")
-            save_to_xlsx(scraped_data, f"{base_filename}.xlsx")
-            save_to_json(scraped_data, f"{base_filename}.json")
-            save_to_docx(scraped_data, f"{base_filename}.docx")
+            try:
+                item: Dict[str, Any] = {}
+                for field_name, cell_index in self.column_mapping.items():
+                    raw_text = cells[cell_index].text.strip()
+                    if field_name == "seller":
+                        item[field_name] = raw_text.split('\n')[0].strip()
+                    else:
+                        item[field_name] = raw_text
+
+                # Числовая нормализация данных
+                item['price_numeric'] = self._clean_price(item.get('price'))
+                item['battery_numeric'] = self._clean_battery(item.get('battery'))
+                item['storage_gb'] = self._clean_storage(item.get('storage'))
+
+                results.append(item)
+            except Exception as e:
+                logging.warning(f"Ошибка при разборе строки #{idx}: {e}")
+                continue
+
+        # Расчет показателей выгоды
+        self._compute_deal_scores(results)
+
+        self.scraped_data = results
+        self.statistics = calculate_statistics(results)
+        return results
+
+    def run(self, url: Optional[str] = None, html_file: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Главный запускающий метод скрапера.
+        """
+        html_content = None
+        if html_file:
+            html_content = self.load_from_file(html_file)
+        elif url:
+            html_content = self.fetch_html(url)
         else:
-            logging.warning("HTML отримано, але не вдалося вилучити дані. Перевірте CSS-селектори та структуру сторінки.")
-            # Зберігаємо HTML для аналізу в разі помилки
-            with open("debug_page.html", "w", encoding="utf-8") as f:
-                f.write(html_content)
-            logging.info("HTML-код сторінки збережено в debug_page.html для аналізу.")
-    
-    logging.info("Робота завершена.")
+            raise ValueError("Необходимо передать либо 'url', либо 'html_file'.")
+
+        if html_content:
+            return self.parse_html(html_content)
+        else:
+            logging.error("Не удалось получить содержимое HTML.")
+            return []
 
 
-if __name__ == "__main__":
-    main()
+# --- Функции обратной совместимости (для совместимости со старыми вызовами) ---
+
+def fetch_page_html(api_key: str, url: str) -> Optional[str]:
+    scraper = SwappaScraper(api_key=api_key)
+    return scraper.fetch_html(url)
+
+def parse_html_data(html_content: str) -> List[Dict[str, Any]]:
+    scraper = SwappaScraper()
+    return scraper.parse_html(html_content)

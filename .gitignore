@@ -16,12 +16,18 @@ dist/
 *.egg-info/
 sdist/
 
+# --- Бази даних ---
+*.db
+*.sqlite
+*.sqlite3
+
 # --- Файли, що генеруються парсером (ваші правила, все правильно!) ---
 *.csv
 *.docx
 *.xlsx
 *.json
 *.html
+!sample_swappa.html
 *.png
 debug_page.html
 
